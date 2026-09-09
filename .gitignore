@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.env
+*.log
+
+# Celery Beat runtime state
+celerybeat-schedule*
+celerybeat.pid
+
+# NOTE: alembic/versions is deliberately NOT ignored — migrations are source code.

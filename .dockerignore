@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.env
+.git/
+.gitignore
+*.md
+tests/
+.vscode/
+launch.json
+*.log
+celerybeat-schedule*
+celerybeat.pid
+
+# NOTE: alembic/versions must stay in the image so `alembic upgrade head` works.
