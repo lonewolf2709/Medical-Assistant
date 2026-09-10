@@ -1,18 +1,14 @@
 """OCR + LLM prescription extraction service using Gemini."""
-import base64
 import json
 import re
 
-import google.generativeai as genai
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import Prescription, User
-
-genai.configure(api_key=settings.gemini_api_key)
-_model = genai.GenerativeModel(settings.gemini_model)
+from app.services import llm
 
 EXTRACT_PROMPT = """You are a prescription parser. Look at this prescription image and extract all medications.
 Return ONLY a valid JSON array of objects with these fields:
@@ -48,15 +44,12 @@ async def extract_medications(db: AsyncSession, prescription: Prescription) -> l
         resp.raise_for_status()
         image_bytes = resp.content
 
-    image_b64 = base64.b64encode(image_bytes).decode()
-
-    response = await _model.generate_content_async([
-        {"mime_type": "image/jpeg", "data": image_b64},
-        EXTRACT_PROMPT
-    ])
+    raw = await llm.generate_from_media(
+        data=image_bytes, mime_type="image/jpeg", prompt=EXTRACT_PROMPT
+    )
 
     try:
-        medications = _extract_json_array(response.text)
+        medications = _extract_json_array(raw)
     except Exception:
         medications = []
 

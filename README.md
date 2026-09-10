@@ -22,6 +22,14 @@ Re-adding an existing medication updates it rather than duplicating it, matched 
 Celery worker polling every 60 seconds. A daily task rolls the window forward so reminders keep
 arriving indefinitely.
 
+**Per-user timezones** — Slot times resolve against each user's own clock. *"I'm in Karachi"* sets
+`users.timezone` and reschedules their queued reminders; `USER_TIMEZONE` is the fallback for anyone
+who hasn't said.
+
+**Finite courses** — "Take azithromycin for 5 days" sets a `course_end`. Reminders stop at the
+end of the course, leftover reminders are retired, the medication is marked `completed`, and the
+user is told. A medication with no duration (a vitamin) is ongoing and reminds indefinitely.
+
 **Dose tracking** — Every reminder carries ✅ Taken / ❌ Skipped / ⏰ Snooze buttons. Stock is
 decremented only when the user confirms they took the dose, and each reminder can be answered once.
 
@@ -30,6 +38,8 @@ denominator is reminders *sent*, so an ignored reminder counts as missed.
 
 **Refill alerts** — The bot projects remaining tablets against the daily dose and warns before
 depletion (default 5 days ahead, or immediately if already low), with Add to Cart / Buy Now buttons.
+The projection is recomputed daily so it tracks actual stock rather than the plan at add-time, with
+a cooldown so someone sitting at zero is not re-alerted every day.
 
 **Reorder cart** — Add medicines to a cart and get a price comparison across 1mg, PharmEasy and
 Apollo with buy links. *Prices are model-generated approximations, not live data.*
@@ -67,7 +77,9 @@ FastAPI ── verifies secret, returns 200 immediately, processes in the backgr
                                         │
 Celery Beat                             ▼
    ├── poll_reminders   (every 60s) → due reminder_events → Telegram
+   │                                 → retires finished courses
    └── top_up_reminders (daily)     → extends the precomputed window
+                                     → reprojects refill alerts
 ```
 
 Reminder dispatch uses `SELECT … FOR UPDATE SKIP LOCKED` with a single commit per batch, so
@@ -79,7 +91,7 @@ multiple workers never send the same reminder twice.
 | Database | PostgreSQL, async via asyncpg |
 | ORM / migrations | SQLAlchemy 2 (async) + Alembic |
 | Task queue | Celery + Celery Beat, Redis broker |
-| LLM | Google Gemini 2.5 Flash (text, vision, audio) |
+| LLM | Google Gemini 2.5 Flash via `google-genai` (text, vision, audio) |
 | Messaging | Telegram Bot API via httpx |
 | Tests | pytest + pytest-asyncio |
 
@@ -155,7 +167,7 @@ createdb medibuddy_test        # or set TEST_DATABASE_URL
 pytest
 ```
 
-48 tests run against a real PostgreSQL database (the schema is rebuilt per test) so
+97 tests run against a real PostgreSQL database (the schema is rebuilt per test) so
 `FOR UPDATE SKIP LOCKED`, Postgres enums and UUID handling behave as in production. Every
 outbound Telegram and Gemini call is stubbed — the suite makes no network requests.
 
@@ -171,12 +183,17 @@ outbound Telegram and Gemini call is stubbed — the suite makes no network requ
 | `GEMINI_API_KEY` | Google AI API key | — |
 | `GEMINI_MODEL` | Gemini model name | `gemini-2.5-flash` |
 | `REDIS_URL` | Celery broker / backend | `redis://localhost:6379/1` |
-| `USER_TIMEZONE` | Timezone for slot times | `Asia/Kolkata` |
+| `USER_TIMEZONE` | Fallback timezone for users who haven't set one | `Asia/Kolkata` |
 | `SCHEDULER_INTERVAL_SECONDS` | Reminder poll interval | `60` |
 | `REMINDER_PRECOMPUTE_DAYS` | Days of reminders to keep queued | `7` |
 | `REFILL_ALERT_DAYS_BEFORE` | Days before depletion to warn | `5` |
+| `REFILL_REALERT_COOLDOWN_DAYS` | Minimum gap between two low-stock alerts | `3` |
 | `PENDING_ACTION_TTL_MINUTES` | Lifetime of an unanswered follow-up prompt | `30` |
 | `VOICE_MAX_DURATION_SECONDS` | Max voice message length | `45` |
+| `TELEGRAM_TIMEOUT_SECONDS` | Telegram request budget | `10` |
+| `TELEGRAM_CONNECT_TIMEOUT_SECONDS` | Telegram connect budget | `10` |
+| `REMINDER_MAX_LATENESS_MINUTES` | Retire a dose reminder later than this, undelivered | `120` |
+| `USER_RATE_LIMIT_PER_MINUTE` | Requests per Telegram user per minute | `20` |
 | `DEBUG` | Mounts the `/dev` router; verbose logs | `false` |
 | `LOG_REQUESTS` | Logs full request bodies — contains health data | `false` |
 
@@ -199,6 +216,7 @@ app/
 │   ├── health.py           /health
 │   └── dev.py              test endpoints, mounted only when DEBUG=true
 └── services/
+    ├── llm.py                  the only module that touches the Gemini SDK
     ├── parser.py               natural language → typed intents (Gemini)
     ├── medication_service.py   CRUD, stock, adherence
     ├── reminder_service.py     event precomputation + daily top-up

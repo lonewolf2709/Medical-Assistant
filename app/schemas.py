@@ -21,6 +21,7 @@ class IntentType(str, Enum):
     REMOVE_FROM_CART = "REMOVE_FROM_CART"
     CHECKOUT = "CHECKOUT"
     ORDER_CONFIRMED = "ORDER_CONFIRMED"
+    SET_TIMEZONE = "SET_TIMEZONE"
     UNKNOWN = "UNKNOWN"
 
 
@@ -29,6 +30,7 @@ class AddMedicationIntent(BaseModel):
     medicine_name: str
     dosage_times: list[str]  # e.g. ["morning", "night"] or ["17:30"]
     total_quantity: float | None = None
+    duration_days: int | None = None  # finite course; None means ongoing
 
 
 class SetReminderIntent(BaseModel):
@@ -49,6 +51,11 @@ class RefillIntent(BaseModel):
 class QnaIntent(BaseModel):
     intent: IntentType = IntentType.QNA
     question: str
+
+
+class SetTimezoneIntent(BaseModel):
+    intent: IntentType = IntentType.SET_TIMEZONE
+    timezone: str  # IANA name, e.g. "Asia/Karachi"
 
 
 class UnknownIntent(BaseModel):
@@ -109,7 +116,8 @@ ParsedIntent = (AddMedicationIntent | SetReminderIntent | RefillIntent | QnaInte
                 ListMedicationsIntent | ConvesationIntent | StopMedicationIntent |
                 PauseMedicationIntent | ResumeMedicationIntent | AdherenceIntent |
                 AddToCartIntent | ViewCartIntent | RemoveFromCartIntent |
-                CheckoutIntent | OrderConfirmedIntent | UnknownIntent)
+                CheckoutIntent | OrderConfirmedIntent | SetTimezoneIntent |
+                UnknownIntent)
 
 
 # --- Telegram webhook schemas ---

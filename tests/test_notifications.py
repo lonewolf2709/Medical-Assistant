@@ -77,3 +77,14 @@ async def test_the_http_client_is_reused_across_calls(monkeypatch):
     first = notif._get_client()
     second = notif._get_client()
     assert first is second
+
+
+def test_the_connect_timeout_is_generous_and_configurable():
+    """A tight connect budget turns an event-loop stall into a spurious
+    ConnectTimeout even when the network is fine."""
+    from app.config import Settings
+    from app.services import notification_service as notif
+
+    defaults = Settings(telegram_bot_token="x")
+    assert defaults.telegram_connect_timeout_seconds >= 10
+    assert notif.TIMEOUT.connect == defaults.telegram_connect_timeout_seconds

@@ -24,6 +24,8 @@ class User(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     telegram_id: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    # IANA name, e.g. "Asia/Kolkata". NULL falls back to the USER_TIMEZONE setting.
+    timezone: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     medications: Mapped[list["Medication"]] = relationship(back_populates="user")
@@ -49,8 +51,10 @@ class Medication(Base):
     total_quantity: Mapped[float] = mapped_column(nullable=False, default=0)
     remaining_quantity: Mapped[float] = mapped_column(nullable=False, default=0)
     daily_dose: Mapped[float] = mapped_column(nullable=False, default=1)
-    status: Mapped[str] = mapped_column(String, nullable=False, default="active")  # active | paused | stopped
+    status: Mapped[str] = mapped_column(String, nullable=False, default="active")  # active | paused | stopped | completed
     paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # End of a finite course ("for 5 days"). NULL means ongoing, e.g. a vitamin.
+    course_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     user: Mapped["User"] = relationship(back_populates="medications")

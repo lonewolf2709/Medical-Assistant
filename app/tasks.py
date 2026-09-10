@@ -32,11 +32,11 @@ def _run(unit_of_work):
 
 @celery_app.task(name="app.tasks.poll_reminders", bind=True, max_retries=3)
 def poll_reminders(self):
-    """Send reminder events whose trigger time has passed."""
-    from app.scheduler import _process_due_events
+    """Send reminder events whose trigger time has passed, and retire finished courses."""
+    from app.scheduler import run_poll_cycle
 
     try:
-        return _run(_process_due_events)
+        return _run(run_poll_cycle)
     except Exception as exc:
         logger.exception("poll_reminders task failed")
         raise self.retry(exc=exc, countdown=30)
@@ -44,17 +44,18 @@ def poll_reminders(self):
 
 @celery_app.task(name="app.tasks.top_up_reminders", bind=True, max_retries=3)
 def top_up_reminders(self):
-    """Extend every active medication's dose events to cover the coming days.
+    """Daily upkeep: extend the dose window and reproject refill alerts.
 
-    Events are otherwise only created when a user adds or changes a medication,
-    so without this a user who stops texting stops getting reminders.
+    Dose events are otherwise only created when a user adds or changes a
+    medication, so without this a user who stops texting stops getting
+    reminders. Refill projections likewise go stale as stock is consumed.
     """
-    from app.services.reminder_service import top_up_dose_events
+    from app.services.reminder_service import run_daily_maintenance
 
     try:
-        topped_up = _run(top_up_dose_events)
-        logger.info("Topped up dose events for %d medications", topped_up)
-        return topped_up
+        result = _run(run_daily_maintenance)
+        logger.info("Daily reminder maintenance: %s", result)
+        return result
     except Exception as exc:
         logger.exception("top_up_reminders task failed")
         raise self.retry(exc=exc, countdown=300)

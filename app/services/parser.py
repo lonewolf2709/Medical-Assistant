@@ -2,20 +2,17 @@ import json
 import logging
 import re
 
-import google.generativeai as genai
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
 
-from app.config import settings
+from app.services import llm
 from app.schemas import (
     AddMedicationIntent, AdherenceIntent, AddToCartIntent, ViewCartIntent,
     RemoveFromCartIntent, CheckoutIntent, OrderConfirmedIntent,
     ConvesationIntent, IntentType, ListMedicationsIntent, ParsedIntent,
-    QnaIntent, RefillIntent, SetReminderIntent, StopMedicationIntent,
+    QnaIntent, RefillIntent, SetReminderIntent, SetTimezoneIntent, StopMedicationIntent,
     PauseMedicationIntent, ResumeMedicationIntent, UnknownIntent,
 )
 
-genai.configure(api_key=settings.gemini_api_key)
-_model = genai.GenerativeModel(settings.gemini_model)
 logger = logging.getLogger(__name__)
 
 _gemini_retry = retry(
@@ -30,8 +27,12 @@ A single message may contain multiple intents. Extract all of them.
 
 Supported intents:
 - CONVERSATIONAL:{"intent":"CONVERSATION", "message":str}
-- ADD_MEDICATION: { "intent": "ADD_MEDICATION", "medicine_name": str, "dosage_times": [str], "total_quantity": float|null }
+- ADD_MEDICATION: { "intent": "ADD_MEDICATION", "medicine_name": str, "dosage_times": [str], "total_quantity": float|null, "duration_days": int|null }
   dosage_times values: "morning", "evening", "night", or "HH:MM" for custom times
+  duration_days: number of days for a finite course, null if ongoing
+  e.g. "Take azithromycin for 5 days" → duration_days: 5
+  e.g. "Antibiotic twice a day for a week" → duration_days: 7
+  e.g. "Take vitamin D every morning" → duration_days: null
 - SET_REMINDER: { "intent": "SET_REMINDER", "medicine_name": str, "times": [str] }
 - REFILL: { "intent": "REFILL", "medicine_name": str, "quantity": float, "unit": str }
   unit values: "tablet" or "strip"
@@ -69,11 +70,18 @@ Supported intents:
   e.g. "Ordered 2 strips Crocin", "I bought Paracetamol", "Placed order for Vitamin D"
 - CONVERSATION: { "intent": "CONVERSATION", "message": str }
   use for greetings, small talk, how are you, thanks, etc
+- SET_TIMEZONE: { "intent": "SET_TIMEZONE", "timezone": str }
+  use when the user states where they are or which timezone they want
+  timezone must be an IANA name
+  e.g. "I'm in Karachi" → timezone: "Asia/Karachi"
+  e.g. "set my timezone to IST" → timezone: "Asia/Kolkata"
+  e.g. "I moved to London" → timezone: "Europe/London"
 - UNKNOWN: { "intent": "UNKNOWN", "raw_text": str }
   ONLY use UNKNOWN if the message has absolutely no recognisable intent. Never mix UNKNOWN with other intents in the same array.
 
 Examples:
-- "Take Crocin morning and night" → [{"intent": "ADD_MEDICATION", "medicine_name": "Crocin", "dosage_times": ["morning", "night"], "total_quantity": null}]
+- "Take Crocin morning and night" → [{"intent": "ADD_MEDICATION", "medicine_name": "Crocin", "dosage_times": ["morning", "night"], "total_quantity": null, "duration_days": null}]
+- "Azithromycin 500mg once daily for 5 days" → [{"intent": "ADD_MEDICATION", "medicine_name": "Azithromycin 500mg", "dosage_times": ["morning"], "total_quantity": 5, "duration_days": 5}]
 - "Add Crocin 30 tablets and set reminder to 4pm" → [{"intent": "ADD_MEDICATION", "medicine_name": "Crocin", "dosage_times": ["16:00"], "total_quantity": 30}, {"intent": "SET_REMINDER", "medicine_name": "Crocin", "times": ["16:00"]}]
 
 Return ONLY the JSON array, no explanation, no markdown."""
@@ -120,6 +128,8 @@ def _parse_single(data: dict, original_text: str) -> ParsedIntent:
             return CheckoutIntent()
         case IntentType.ORDER_CONFIRMED:
             return OrderConfirmedIntent(**data)
+        case IntentType.SET_TIMEZONE:
+            return SetTimezoneIntent(**data)
         case _:
             return UnknownIntent(raw_text=original_text)
 
@@ -129,12 +139,10 @@ async def parse_intent(text: str) -> list[ParsedIntent]:
         return [UnknownIntent(raw_text=text)]
     try:
         @_gemini_retry
-        async def _call():
-            return await _model.generate_content_async(
-                f"{SYSTEM_PROMPT}\n\nUser message: {text}"
-            )
-        response = await _call()
-        parsed = _extract_json(response.text)
+        async def _call() -> str:
+            return await llm.generate_text(f"{SYSTEM_PROMPT}\n\nUser message: {text}")
+
+        parsed = _extract_json(await _call())
 
         # Normalise: always work with a list
         if isinstance(parsed, dict):

@@ -15,7 +15,10 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{settings.telegram_bot_token}"
-TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+TIMEOUT = httpx.Timeout(
+    settings.telegram_timeout_seconds,
+    connect=settings.telegram_connect_timeout_seconds,
+)
 
 _client: httpx.AsyncClient | None = None
 

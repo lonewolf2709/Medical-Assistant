@@ -1,5 +1,5 @@
 import uuid
-from datetime import time
+from datetime import datetime, time, timedelta, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,7 +31,13 @@ async def add_or_update_medication(
     name: str,
     dosage_times: list[str],
     total_quantity: float | None,
+    duration_days: int | None = None,
 ) -> Medication:
+    """Create or update a medication.
+
+    `duration_days` marks a finite course ("take it for 5 days"); without it the
+    medication is ongoing and reminders continue until the user stops it.
+    """
     med = await get_medication(db, user_id, name)
     if med is None:
         qty = total_quantity or 0.0
@@ -53,6 +59,19 @@ async def add_or_update_medication(
         from sqlalchemy import delete as sa_delete
         await db.execute(sa_delete(DosageTime).where(DosageTime.medication_id == med.id))
         await db.flush()
+
+    # Explicitly adding a medication again restarts it — otherwise a finished
+    # course could never be picked back up.
+    if med.status in ("completed", "stopped"):
+        med.status = "active"
+        med.paused_until = None
+        if duration_days is None:
+            # Restarted without a new duration → treat it as ongoing, else the
+            # stale course_end would block every event and re-complete it.
+            med.course_end = None
+
+    if duration_days is not None and duration_days > 0:
+        med.course_end = datetime.now(timezone.utc) + timedelta(days=duration_days)
 
     _attach_dosage_times(db, med, dosage_times)
     await db.commit()

@@ -1,6 +1,7 @@
 """Structured logging configuration for MediBuddy."""
 import logging
 import sys
+import time
 from pythonjsonlogger import jsonlogger
 
 
@@ -15,6 +16,10 @@ def setup_logging(level: str = "INFO") -> None:
         rename_fields={"asctime": "timestamp", "levelname": "level", "name": "logger"},
     )
 
+    # asctime renders in local time by default, but the format above claims "Z".
+    # Emit real UTC so log timestamps can be compared with the database.
+    formatter.converter = time.gmtime
+
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(formatter)
 
@@ -26,5 +31,8 @@ def setup_logging(level: str = "INFO") -> None:
     # Suppress noisy third-party loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    # Access logs are useful while debugging and noise in production.
+    logging.getLogger("uvicorn.access").setLevel(
+        logging.INFO if log_level <= logging.DEBUG else logging.WARNING
+    )
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)

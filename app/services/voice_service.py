@@ -1,16 +1,12 @@
 """Voice message handling: download from Telegram + transcribe via Gemini."""
-import base64
 import logging
 
-import google.generativeai as genai
 import httpx
 
 from app.config import settings
+from app.services import llm
 
 logger = logging.getLogger(__name__)
-
-genai.configure(api_key=settings.gemini_api_key)
-_model = genai.GenerativeModel(settings.gemini_model)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{settings.telegram_bot_token}"
 
@@ -39,13 +35,15 @@ async def get_voice_bytes(file_id: str) -> bytes | None:
 async def transcribe(audio_bytes: bytes) -> str | None:
     """Send OGG audio bytes to Gemini and return transcribed text."""
     try:
-        audio_b64 = base64.b64encode(audio_bytes).decode()
-        response = await _model.generate_content_async([
-            {"mime_type": "audio/ogg", "data": audio_b64},
-            "Transcribe this voice message exactly as spoken. Return only the transcribed text, nothing else."
-        ])
-        text = (response.text or "").strip()
-        return text if text else None
+        text = await llm.generate_from_media(
+            data=audio_bytes,
+            mime_type="audio/ogg",
+            prompt=(
+                "Transcribe this voice message exactly as spoken. "
+                "Return only the transcribed text, nothing else."
+            ),
+        )
+        return text or None
     except Exception:
         logger.exception("Gemini transcription failed")
         return None

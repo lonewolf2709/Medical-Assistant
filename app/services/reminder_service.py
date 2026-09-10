@@ -3,11 +3,11 @@ import uuid
 from datetime import datetime, timedelta, timezone, time
 
 import pytz
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import DosageTime, Medication, ReminderEvent
+from app.models import DosageTime, Medication, ReminderEvent, User
 
 SLOT_TIMES: dict[str, time] = {
     "morning": time(8, 0),
@@ -15,14 +15,30 @@ SLOT_TIMES: dict[str, time] = {
     "night": time(21, 0),
 }
 
-USER_TZ = pytz.timezone(settings.user_timezone)
+DEFAULT_TZ = pytz.timezone(settings.user_timezone)
 
 logger = logging.getLogger(__name__)
 
 
-def _to_utc(local_dt: datetime) -> datetime:
-    """Convert a naive local datetime to UTC."""
-    return USER_TZ.localize(local_dt).astimezone(pytz.utc)
+async def timezone_for(db: AsyncSession, user_id: uuid.UUID):
+    """The user's own timezone, falling back to the configured default.
+
+    Reminders belong to a person's clock, so slot times ("morning") must be
+    resolved per user rather than against one process-wide timezone.
+    """
+    name = await db.scalar(select(User.timezone).where(User.id == user_id))
+    if not name:
+        return DEFAULT_TZ
+    try:
+        return pytz.timezone(name)
+    except pytz.UnknownTimeZoneError:
+        logger.warning("User %s has an unknown timezone %r — using the default", user_id, name)
+        return DEFAULT_TZ
+
+
+def _to_utc(local_dt: datetime, tz=DEFAULT_TZ) -> datetime:
+    """Convert a naive local datetime in `tz` to UTC."""
+    return tz.localize(local_dt).astimezone(pytz.utc)
 
 
 async def regenerate_dose_events(db: AsyncSession, medication: Medication) -> None:
@@ -36,6 +52,7 @@ async def regenerate_dose_events(db: AsyncSession, medication: Medication) -> No
     )
 
     now = datetime.now(timezone.utc)
+    tz = await timezone_for(db, medication.user_id)
 
     # Explicitly load dosage_times — lazy loading not allowed in async
     result = await db.execute(
@@ -51,7 +68,9 @@ async def regenerate_dose_events(db: AsyncSession, medication: Medication) -> No
                 continue
             # Combine as local time, then convert to UTC
             local_dt = datetime.combine(base_date, slot_time)
-            trigger = _to_utc(local_dt)
+            trigger = _to_utc(local_dt, tz)
+            if medication.course_end and trigger >= medication.course_end:
+                continue  # finite course — no doses beyond its end
             if trigger > now:
                 db.add(ReminderEvent(
                     user_id=medication.user_id,
@@ -75,6 +94,7 @@ async def regenerate_refill_event(db: AsyncSession, medication: Medication) -> N
     )
 
     if medication.daily_dose <= 0:
+        await db.commit()
         return
 
     if medication.status != "active":
@@ -83,11 +103,32 @@ async def regenerate_refill_event(db: AsyncSession, medication: Medication) -> N
 
     days_remaining = medication.remaining_quantity / medication.daily_dose
     days_until_alert = days_remaining - settings.refill_alert_days_before
-
     now = datetime.now(timezone.utc)
-    # Already inside the alert window (or out of stock) — warn on the next poll
-    # rather than not at all, which is the case that matters most.
-    trigger = now + timedelta(days=days_until_alert) if days_until_alert > 0 else now
+
+    if days_until_alert > 0:
+        trigger = now + timedelta(days=days_until_alert)
+    else:
+        # Already inside the alert window (or out of stock) — warn on the next
+        # poll rather than not at all. But this path is recomputed daily, so
+        # suppress it if we warned recently, or it becomes a daily nag.
+        last_alert = await db.scalar(
+            select(func.max(ReminderEvent.trigger_time)).where(
+                ReminderEvent.medication_id == medication.id,
+                ReminderEvent.type == "refill",
+                ReminderEvent.status == "sent",
+            )
+        )
+        if last_alert and (now - last_alert) < timedelta(
+            days=settings.refill_realert_cooldown_days
+        ):
+            logger.info(
+                "Holding refill re-alert for %s — last warned %s ago",
+                medication.name, now - last_alert,
+            )
+            await db.commit()
+            return
+        trigger = now
+
     db.add(ReminderEvent(
         user_id=medication.user_id,
         medication_id=medication.id,
@@ -121,7 +162,14 @@ async def top_up_dose_events(
     ).scalars().all()
 
     topped_up = 0
+    tz_cache: dict = {}
     for medication in medications:
+        if medication.course_end and medication.course_end <= now:
+            continue  # course is over; complete_finished_courses retires it
+
+        if medication.user_id not in tz_cache:
+            tz_cache[medication.user_id] = await timezone_for(db, medication.user_id)
+        tz = tz_cache[medication.user_id]
         dosage_times = (
             await db.execute(
                 select(DosageTime).where(DosageTime.medication_id == medication.id)
@@ -148,7 +196,9 @@ async def top_up_dose_events(
                 slot_time = _dose_slot_time(dosage_time)
                 if slot_time is None:
                     continue
-                trigger = _to_utc(datetime.combine(base_date, slot_time))
+                trigger = _to_utc(datetime.combine(base_date, slot_time), tz)
+                if medication.course_end and trigger >= medication.course_end:
+                    continue
                 if trigger <= now or trigger in existing:
                     continue
                 db.add(ReminderEvent(
@@ -169,3 +219,70 @@ async def top_up_dose_events(
 
     await db.commit()
     return topped_up
+
+
+async def complete_finished_courses(
+    db: AsyncSession, now: datetime | None = None
+) -> list[Medication]:
+    """Retire medications whose finite course has ended.
+
+    Marks them `completed` and drops any leftover pending reminders. Returns the
+    medications that were just completed, so the caller can tell the user.
+    Medications with no `course_end` are ongoing and never completed here.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    medications = (
+        await db.execute(
+            select(Medication)
+            .where(
+                Medication.status == "active",
+                Medication.course_end.isnot(None),
+                Medication.course_end <= now,
+            )
+            # The active→completed flip is what makes the announcement once-only,
+            # so lock the rows: without this two workers could both read the row
+            # as active and both announce before either commits.
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().all()
+    if not medications:
+        return []
+
+    for medication in medications:
+        medication.status = "completed"
+
+    await db.execute(
+        delete(ReminderEvent).where(
+            ReminderEvent.medication_id.in_([m.id for m in medications]),
+            ReminderEvent.status == "pending",
+        )
+    )
+    await db.commit()
+
+    logger.info("Completed %d finished course(s)", len(medications))
+    return list(medications)
+
+
+async def refresh_refill_events(db: AsyncSession) -> int:
+    """Recompute every active medication's refill projection.
+
+    The projection is otherwise only calculated when stock or the schedule
+    changes, so it drifts from reality as doses are taken, skipped or missed.
+    Returns the number of medications reprojected.
+    """
+    medications = (
+        await db.execute(select(Medication).where(Medication.status == "active"))
+    ).scalars().all()
+
+    for medication in medications:
+        await regenerate_refill_event(db, medication)
+
+    return len(medications)
+
+
+async def run_daily_maintenance(db: AsyncSession) -> dict[str, int]:
+    """Daily upkeep: extend the dose window, then reproject refill alerts."""
+    topped_up = await top_up_dose_events(db)
+    refreshed = await refresh_refill_events(db)
+    return {"dose_windows_topped_up": topped_up, "refill_projections_refreshed": refreshed}

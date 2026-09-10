@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.database import AsyncSessionLocal
-from app.rate_limiter import limiter
+from app.rate_limiter import limiter, user_limiter
 from app.schemas import ConvesationIntent, QnaIntent, TelegramUpdate
 from app.services import medication_service, message_log_service, qa_service, reminder_service
 from app.services.notification_service import (
@@ -31,6 +31,20 @@ SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
 
 
 _esc = esc
+
+
+def _telegram_user_id(update: dict) -> str | None:
+    """The sender's Telegram id, wherever it sits in the update."""
+    for holder in (
+        update.get("message"),
+        update.get("callback_query"),
+        update.get("edited_message"),
+    ):
+        if isinstance(holder, dict):
+            sender = holder.get("from")
+            if isinstance(sender, dict) and sender.get("id") is not None:
+                return str(sender["id"])
+    return None
 
 
 def _secret_is_valid(token: str | None) -> bool:
@@ -60,6 +74,14 @@ async def telegram_webhook(
             extra={"client": request.client.host if request.client else "unknown"},
         )
         return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+
+    # Per-user budget. The IP limit above cannot separate users, since every
+    # genuine update comes from Telegram's servers. Answer 200 either way so
+    # Telegram treats the update as delivered instead of retrying it.
+    sender_id = _telegram_user_id(update)
+    if sender_id and not user_limiter.allow(sender_id):
+        logger.warning("Dropping update — user %s is over their rate limit", sender_id)
+        return {"ok": True}
 
     # Handle callback_query (button presses)
     if update.get("callback_query"):
@@ -101,6 +123,9 @@ async def _process_message_inner(update: TelegramUpdate) -> None:
             logger.exception("Failed to get or create user %s", telegram_id)
             await send_message(chat_id, "Something went wrong. Please try again.")
             return
+
+        kind = "photo" if message.photo else "voice" if message.voice else "text"
+        logger.info("Handling %s update from user %s", kind, telegram_id)
 
         # Handle prescription image upload
         if message.photo:
@@ -157,6 +182,13 @@ async def _process_message_inner(update: TelegramUpdate) -> None:
             msg_record = None
 
         intents = await parse_intent(raw_text)
+        logger.info(
+            "Parsed %d intent(s) from user %s: %s",
+            len(intents), telegram_id,
+            ", ".join(getattr(i.intent, "value", str(i.intent)) for i in intents),
+        )
+        # Message text is health information — only at DEBUG, never at INFO.
+        logger.debug("Text from user %s: %r", telegram_id, raw_text)
 
         if msg_record:
             try:
@@ -182,6 +214,9 @@ async def _process_message_inner(update: TelegramUpdate) -> None:
             await delete_message(chat_id, placeholder_id)
 
         combined_reply = "\n\n".join(replies)
+        logger.info(
+            "Replied to user %s with %d character(s)", telegram_id, len(combined_reply)
+        )
 
         if msg_record:
             try:
@@ -195,7 +230,8 @@ async def _route_intent(db, user, intent, chat_id: str, placeholder_id: int | No
                               ListMedicationsIntent, ConvesationIntent, StopMedicationIntent,
                               PauseMedicationIntent, ResumeMedicationIntent, AdherenceIntent,
                               AddToCartIntent, ViewCartIntent, RemoveFromCartIntent,
-                              CheckoutIntent, OrderConfirmedIntent, UnknownIntent)
+                              CheckoutIntent, OrderConfirmedIntent, SetTimezoneIntent,
+                              UnknownIntent)
     from app.services.conversation_service import respond as conversation_respond
     from app.services import cart_service
 
@@ -212,12 +248,16 @@ async def _route_intent(db, user, intent, chat_id: str, placeholder_id: int | No
             if not intent.medicine_name:
                 return "What is the name of the medication you'd like to add?"
             med = await medication_service.add_or_update_medication(
-                db, user.id, intent.medicine_name, intent.dosage_times, intent.total_quantity
+                db, user.id, intent.medicine_name, intent.dosage_times,
+                intent.total_quantity, duration_days=intent.duration_days,
             )
             await reminder_service.regenerate_dose_events(db, med)
             await reminder_service.regenerate_refill_event(db, med)
             times = _esc(", ".join(intent.dosage_times))
-            return f"✅ Added <b>{_esc(med.name)}</b> with reminders at: {times}"
+            reply = f"✅ Added <b>{_esc(med.name)}</b> with reminders at: {times}"
+            if intent.duration_days:
+                reply += f" for {intent.duration_days} day(s)"
+            return reply
 
         case SetReminderIntent():
             from app.services.medication_service import get_medication
@@ -228,6 +268,9 @@ async def _route_intent(db, user, intent, chat_id: str, placeholder_id: int | No
                 db, user.id, intent.medicine_name, intent.times, None
             )
             await reminder_service.regenerate_dose_events(db, med)
+            # daily_dose changed with the schedule, so the burn rate — and the
+            # refill projection built on it — must be recalculated too.
+            await reminder_service.regenerate_refill_event(db, med)
             times = _esc(", ".join(intent.times))
             return f"✅ Updated reminders for <b>{_esc(med.name)}</b> to: {times}"
 
@@ -251,7 +294,7 @@ async def _route_intent(db, user, intent, chat_id: str, placeholder_id: int | No
             if not meds:
                 return "You have no medications added yet. Try: 'Take Crocin morning and night'"
             import pytz
-            user_tz = pytz.timezone(settings.user_timezone)
+            user_tz = pytz.timezone(user.timezone or settings.user_timezone)
             lines = ["📋 <b>Your Medications:</b>\n"]
             for m in meds:
                 times_str = _esc(", ".join(m["times"])) if m["times"] else "no times set"
@@ -263,6 +306,40 @@ async def _route_intent(db, user, intent, chat_id: str, placeholder_id: int | No
                     next_str = "no upcoming reminder"
                 lines.append(f"• <b>{_esc(m['name'])}</b> — {times_str} | {remaining} | {next_str}")
             return "\n".join(lines)
+
+        case SetTimezoneIntent():
+            import pytz
+            from sqlalchemy import select as sa_select
+
+            from app.models import Medication as MedicationModel
+
+            try:
+                pytz.timezone(intent.timezone)
+            except pytz.UnknownTimeZoneError:
+                return (
+                    f"I didn't recognise <b>{_esc(intent.timezone)}</b> as a timezone. "
+                    f"Try an IANA name like <i>Asia/Kolkata</i> or <i>Europe/London</i>."
+                )
+
+            user.timezone = intent.timezone
+            await db.commit()
+
+            # Queued reminders were computed against the old clock, so move them.
+            medications = (
+                await db.execute(
+                    sa_select(MedicationModel).where(
+                        MedicationModel.user_id == user.id,
+                        MedicationModel.status == "active",
+                    )
+                )
+            ).scalars().all()
+            for medication in medications:
+                await reminder_service.regenerate_dose_events(db, medication)
+
+            return (
+                f"🕐 Timezone set to <b>{_esc(intent.timezone)}</b>. "
+                f"Rescheduled {len(medications)} medication(s) to your local time."
+            )
 
         case UnknownIntent():
             return "I didn't understand that. Try: 'Take Crocin morning and night' or 'I have 30 Crocin tablets'."
@@ -322,6 +399,20 @@ async def _route_intent(db, user, intent, chat_id: str, placeholder_id: int | No
             return f"⏸️ <b>{_esc(med.name)}</b> paused for {intent.days} day(s). Reminders will resume after that."
 
         case ResumeMedicationIntent():
+            from app.services.medication_service import get_medication
+
+            existing = await get_medication(db, user.id, intent.medicine_name)
+            if existing is None:
+                return f"I couldn't find <b>{_esc(intent.medicine_name)}</b> in your medications."
+            if existing.status == "completed":
+                # resume_medication only restarts paused/stopped courses, so do not
+                # claim otherwise — a finished course needs a new duration.
+                name = _esc(existing.name)
+                return (
+                    f"Your course of <b>{name}</b> is already complete. "
+                    f"To carry on, tell me how long — e.g. "
+                    f"<i>'take {name} for 3 more days'</i>."
+                )
             med = await medication_service.resume_medication(db, user.id, intent.medicine_name)
             if med is None:
                 return f"I couldn't find <b>{_esc(intent.medicine_name)}</b> in your medications."

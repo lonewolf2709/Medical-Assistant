@@ -29,12 +29,31 @@ When a medication is added or updated, the bot automatically precomputes dose re
 - A daily Celery Beat task (`top_up_reminders`) rolls the window forward, so reminders keep
   arriving for users who never message the bot again. It is idempotent — existing trigger
   times are never duplicated.
+- The window rolls **one day at a time**: each run recomputes "today → today+6" and inserts only
+  what is missing, so a 14-day course is covered seamlessly without ever queueing it all up front.
+
+### 3b. Finite Courses
+
+A medication carries an optional `course_end`. `"Take azithromycin for 5 days"` is parsed into
+`duration_days: 5`, which sets `course_end = now + 5 days`.
+
+- Neither generator creates an event at or after `course_end`, so the course cannot run long
+- Once `course_end` passes, `complete_finished_courses` marks the medication `completed`, deletes
+  its leftover pending reminders, and the poll cycle tells the user
+- `course_end = NULL` means an ongoing medication (a vitamin) — reminders continue until stopped
+
+Without this, the daily top-up would roll a finite course forward forever.
 
 ### 4. Refill Alerts
 The bot tracks remaining tablet count per medication. When remaining quantity divided by daily dose is within 5 days of running out, a refill `reminder_event` is precomputed and stored. The alert fires automatically via the scheduler.
 
 If a medication is *already* inside the alert window (or out of stock) the alert is scheduled
 immediately rather than skipped. The reminder carries "Add to Cart" and "Buy Now" buttons.
+
+The projection is refreshed by the daily maintenance task (`run_daily_maintenance`), so it follows
+real stock instead of the estimate made when the medication was added — and by `SET_REMINDER`,
+since changing the schedule changes `daily_dose` and therefore the burn rate. Immediate re-alerts
+are suppressed for `REFILL_REALERT_COOLDOWN_DAYS` so a daily recompute cannot nag.
 
 ### 5. Dose Quantity Tracking
 Stock is decremented when the user taps **✅ Taken** — not when the reminder is sent, since at
@@ -159,7 +178,7 @@ A `/dev` router provides HTTP endpoints for testing without Telegram. These acce
 | Database | PostgreSQL (async via asyncpg) |
 | ORM | SQLAlchemy async |
 | Migrations | Alembic |
-| LLM | Google Gemini 2.5 Flash |
+| LLM | Google Gemini 2.5 Flash via `google-genai` |
 | Bot | Telegram Bot API |
 | HTTP client | httpx |
 | Task queue / scheduler | Celery + Celery Beat (Redis broker) |
@@ -203,8 +222,8 @@ Celery Beat
 
 | Table | Purpose |
 |---|---|
-| users | Telegram user registry (UUID + telegram_id) |
-| medications | Medication records per user (name, quantity, daily_dose) |
+| users | Telegram user registry (UUID, telegram_id, timezone) |
+| medications | Medication records per user (name, quantity, daily_dose, course_end) |
 | dosage_times | Slot or custom time per medication |
 | reminder_events | Precomputed future notifications (dose + refill) |
 | prescriptions | Uploaded prescription image URLs + extracted text |
@@ -224,12 +243,17 @@ Celery Beat
 | `REDIS_URL` | Celery broker / result backend |
 | `GEMINI_API_KEY` | Google AI API key |
 | `GEMINI_MODEL` | Model name (default: `gemini-2.5-flash-preview-04-17`) |
-| `USER_TIMEZONE` | User's local timezone (default: `Asia/Kolkata`) |
+| `USER_TIMEZONE` | Fallback timezone for users who have not set one (default: `Asia/Kolkata`) |
 | `SCHEDULER_INTERVAL_SECONDS` | How often scheduler polls (default: 60) |
 | `REMINDER_PRECOMPUTE_DAYS` | Days ahead to precompute reminders (default: 7) |
 | `REFILL_ALERT_DAYS_BEFORE` | Days before depletion to trigger refill alert (default: 5) |
+| `REFILL_REALERT_COOLDOWN_DAYS` | Minimum gap between two low-stock alerts (default: 3) |
 | `VOICE_MAX_DURATION_SECONDS` | Max voice message length (default: 45) |
 | `PENDING_ACTION_TTL_MINUTES` | How long an unanswered follow-up prompt stays live (default: 30) |
+| `TELEGRAM_TIMEOUT_SECONDS` | Telegram request budget in seconds (default: 10) |
+| `TELEGRAM_CONNECT_TIMEOUT_SECONDS` | Telegram connect budget in seconds (default: 10) |
+| `REMINDER_MAX_LATENESS_MINUTES` | Dose reminders later than this are retired undelivered (default: 120) |
+| `USER_RATE_LIMIT_PER_MINUTE` | Per-Telegram-user request budget (default: 20) |
 | `DEBUG` | Mounts the `/dev` router; verbose logging (default: false) |
 | `LOG_REQUESTS` | Logs full request bodies — contains health data, development only (default: false) |
 
@@ -431,7 +455,7 @@ createdb medibuddy_test          # or: TEST_DATABASE_URL=postgresql+asyncpg://..
 pytest
 ```
 
-Tests run against a real PostgreSQL database (the schema is recreated per test), so
+The 97 tests run against a real PostgreSQL database (the schema is recreated per test), so
 `FOR UPDATE SKIP LOCKED`, Postgres enums and UUID behaviour are exercised as in production. All
 outbound Telegram and Gemini calls are stubbed — the suite makes no network requests.
 
@@ -439,8 +463,32 @@ outbound Telegram and Gemini calls are stubbed — the suite makes no network re
 
 ## Known gaps
 
-- **Single timezone.** `USER_TIMEZONE` is process-wide; `users` has no timezone column, so all
-  users are reminded on one clock.
+- ~~Single timezone~~ — resolved: `users.timezone` holds an IANA name per user and slot times are
+  converted against it. `USER_TIMEZONE` is now only the fallback.
 - **Message processing is in-process.** Durable across restarts only once dispatch moves to Celery.
 - **Cart prices are model-generated.** `cart_service` asks Gemini for current INR prices, which are
   approximations from training data, not live prices. Treat "cheapest platform" as a hint.
+
+
+---
+
+## LLM access
+
+Every Gemini call goes through `app/services/llm.py`, the only module that imports the SDK:
+
+| Function | Used by |
+|---|---|
+| `generate_text` | `parser`, `cart_service` |
+| `generate_from_media` | `voice_service` (audio), `prescription_service` (images) |
+| `stream_reply` | `qa_service`, `conversation_service` |
+| `normalise_history` | stored chat history → the shape the SDK accepts |
+
+The project moved off `google.generativeai`, which reached end of life and whose async
+methods wrapped blocking calls — starving the event loop and surfacing as spurious
+`ConnectTimeout`s on a healthy network. Two migration hazards worth remembering:
+
+- **Media is raw bytes.** The old SDK took base64 inside a dict; this one takes bytes. Passing
+  base64 would send the encoded string as though it were the audio or image.
+- **History parts must be objects.** `{"parts": ["hi"]}` is rejected; it must be
+  `{"parts": [{"text": "hi"}]}`. `normalise_history` handles the conversion, since
+  `message_log_service` stores the former.

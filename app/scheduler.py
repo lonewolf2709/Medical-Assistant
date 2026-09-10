@@ -1,6 +1,6 @@
 """Polling-based scheduler: dispatches pending reminder events every N seconds."""
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,6 +9,7 @@ from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models import Medication, ReminderEvent, User
 from app.services.notification_service import send_message, send_message_with_buttons
+from app.services.reminder_service import complete_finished_courses
 from app.telegram_format import esc
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,20 @@ async def _process_due_events(db: AsyncSession) -> None:
                 )
             ).scalar_one_or_none()
             med_name = esc(medication.name) if medication else "your medication"
+
+            # A dose belongs to a moment. Delivering one hours or months late
+            # invites the user to take a dose they have missed, and tapping
+            # "Taken" would decrement stock and count toward adherence.
+            # Refill alerts are a state rather than a moment, so they still stand.
+            lateness = now - event.trigger_time
+            if event.type == "dose" and lateness > timedelta(
+                minutes=settings.reminder_max_lateness_minutes
+            ):
+                logger.warning(
+                    "Retiring stale dose reminder for %s — %s late", med_name, lateness
+                )
+                event.status = "sent"
+                continue
 
             # Skip if the medication is paused or stopped (treat NULL as active)
             if medication and medication.status and medication.status != "active":
@@ -98,3 +113,23 @@ async def _process_due_events(db: AsyncSession) -> None:
             logger.exception("Error processing event %s", event.id)
 
     await db.commit()
+
+
+async def _announce_finished_courses(db: AsyncSession) -> None:
+    """Tell users when a finite course has run its last dose."""
+    for medication in await complete_finished_courses(db):
+        user = await db.get(User, medication.user_id)
+        if user is None:
+            continue
+        await send_message(
+            user.telegram_id,
+            f"✅ That's the end of your course of <b>{esc(medication.name)}</b>. "
+            f"Reminders have stopped. If your doctor extended it, tell me "
+            f"\"take {esc(medication.name)} for 3 more days\".",
+        )
+
+
+async def run_poll_cycle(db: AsyncSession) -> None:
+    """One scheduler tick: send what is due, then retire finished courses."""
+    await _process_due_events(db)
+    await _announce_finished_courses(db)

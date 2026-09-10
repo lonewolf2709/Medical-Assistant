@@ -150,3 +150,54 @@ async def test_concurrent_pollers_send_each_due_event_exactly_once(db, user, sen
         select(func.count()).select_from(ReminderEvent).where(ReminderEvent.status == "pending")
     )
     assert remaining == 0
+
+
+async def test_a_reminder_that_is_hours_late_is_not_delivered(db, user, sent):
+    """A 60-day-late dose reminder must not arrive as if it were due now —
+    tapping Taken on it would decrement stock and skew adherence."""
+    med = await medication_service.add_or_update_medication(db, user.id, "Crocin", ["morning"], 30)
+    event = ReminderEvent(
+        user_id=user.id, medication_id=med.id,
+        trigger_time=datetime.now(timezone.utc) - timedelta(days=60),
+        type="dose", status="pending",
+    )
+    db.add(event)
+    await db.commit()
+
+    async with AsyncSessionLocal() as poll_db:
+        await _process_due_events(poll_db)
+
+    assert sent["buttons"] == [], "a stale reminder must not be delivered"
+
+
+async def test_a_stale_reminder_is_retired_so_it_stops_coming_back(db, user, sent):
+    med = await medication_service.add_or_update_medication(db, user.id, "Crocin", ["morning"], 30)
+    event = ReminderEvent(
+        user_id=user.id, medication_id=med.id,
+        trigger_time=datetime.now(timezone.utc) - timedelta(days=60),
+        type="dose", status="pending",
+    )
+    db.add(event)
+    await db.commit()
+
+    async with AsyncSessionLocal() as poll_db:
+        await _process_due_events(poll_db)
+
+    await db.refresh(event)
+    assert event.status == "sent", "it must not stay pending and retry forever"
+
+
+async def test_a_reminder_only_slightly_late_is_still_delivered(db, user, sent):
+    """The poll runs once a minute, so a few minutes of lateness is normal."""
+    med = await medication_service.add_or_update_medication(db, user.id, "Crocin", ["morning"], 30)
+    db.add(ReminderEvent(
+        user_id=user.id, medication_id=med.id,
+        trigger_time=datetime.now(timezone.utc) - timedelta(minutes=3),
+        type="dose", status="pending",
+    ))
+    await db.commit()
+
+    async with AsyncSessionLocal() as poll_db:
+        await _process_due_events(poll_db)
+
+    assert len(sent["buttons"]) == 1

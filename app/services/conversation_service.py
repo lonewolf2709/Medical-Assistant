@@ -1,12 +1,12 @@
-"""Conversational responses with streaming typewriter effect."""
+"""Conversational responses with a streaming typewriter effect."""
+import logging
 import time
 
-import google.generativeai as genai
-
-from app.config import settings
+from app.services import llm
 from app.services.notification_service import edit_message, send_message_get_id
 
-genai.configure(api_key=settings.gemini_api_key)
+logger = logging.getLogger(__name__)
+
 
 SYSTEM_INSTRUCTION = """You are MediBuddy, a friendly medication assistant bot on Telegram.
 
@@ -41,33 +41,37 @@ FALLBACK = (
 EDIT_INTERVAL = 0.8
 
 
-async def respond(message: str, chat_id: str, history: list[dict] | None = None, placeholder_id: int | None = None) -> str:
-    """Stream conversational response to Telegram via message edits. Returns full text."""
-    model = genai.GenerativeModel(settings.gemini_model, system_instruction=SYSTEM_INSTRUCTION)
+async def respond(
+    message: str,
+    chat_id: str,
+    history: list[dict] | None = None,
+    placeholder_id: int | None = None,
+) -> str:
+    """Stream a conversational reply via message edits. Returns the full text."""
     try:
-        chat = model.start_chat(history=history or [])
-        if placeholder_id:
-            message_id = placeholder_id
-        else:
-            message_id = await send_message_get_id(chat_id, "💭 <i>Thinking...</i>")
-        if not message_id:
-            response = await chat.send_message_async(message)
-            return (response.text or "").strip() or FALLBACK
+        message_id = placeholder_id or await send_message_get_id(
+            chat_id, "💭 <i>Thinking...</i>"
+        )
 
         full_text = ""
         last_edit = time.monotonic()
 
-        async for chunk in await chat.send_message_async(message, stream=True):
-            if chunk.text:
-                full_text += chunk.text
-                now = time.monotonic()
-                if now - last_edit >= EDIT_INTERVAL and full_text.strip():
-                    await edit_message(chat_id, message_id, full_text + " ✍️")
-                    last_edit = now
+        async for chunk in llm.stream_reply(
+            message=message,
+            system_instruction=SYSTEM_INSTRUCTION,
+            history=history,
+        ):
+            full_text += chunk
+            now = time.monotonic()
+            if message_id and now - last_edit >= EDIT_INTERVAL and full_text.strip():
+                await edit_message(chat_id, message_id, full_text + " ✍️")
+                last_edit = now
 
         final = full_text.strip() or FALLBACK
-        await edit_message(chat_id, message_id, final)
+        if message_id:
+            await edit_message(chat_id, message_id, final)
         return final
 
     except Exception:
+        logger.exception("Conversational reply failed")
         return FALLBACK

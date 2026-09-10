@@ -4,17 +4,14 @@ import re
 import uuid
 from urllib.parse import quote
 
-import google.generativeai as genai
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import CartItem, Medication
+from app.services import llm
 from app.services.medication_service import TABLETS_PER_STRIP, get_medication
 from app.telegram_format import esc
-
-genai.configure(api_key=settings.gemini_api_key)
-_model = genai.GenerativeModel(settings.gemini_model)
 
 PLATFORMS = ["1mg", "PharmEasy", "Apollo"]
 PLATFORM_URLS = {
@@ -74,8 +71,7 @@ Use "N/A" for unknown prices. No explanation outside JSON."""
 async def _fetch_single_price(medicine_name: str) -> dict[str, str]:
     try:
         prompt = SINGLE_PRICE_PROMPT.format(medicine_name=medicine_name)
-        response = await _model.generate_content_async(prompt)
-        text = re.sub(r"^```(?:json)?\s*", "", response.text.strip())
+        text = re.sub(r"^```(?:json)?\s*", "", (await llm.generate_text(prompt)).strip())
         text = re.sub(r"\s*```$", "", text)
         return json.loads(text)
     except Exception:
@@ -87,8 +83,7 @@ async def _fetch_cart_prices(medicines: list[dict]) -> dict:
     try:
         med_list = "\n".join(f"- {m['name']} × {m['qty']} strip(s)" for m in medicines)
         prompt = CART_PRICE_PROMPT.format(medicine_list=med_list)
-        response = await _model.generate_content_async(prompt)
-        text = re.sub(r"^```(?:json)?\s*", "", response.text.strip())
+        text = re.sub(r"^```(?:json)?\s*", "", (await llm.generate_text(prompt)).strip())
         text = re.sub(r"\s*```$", "", text)
         return json.loads(text)
     except Exception:
