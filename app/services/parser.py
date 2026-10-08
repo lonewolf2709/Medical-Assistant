@@ -27,9 +27,14 @@ A single message may contain multiple intents. Extract all of them.
 
 Supported intents:
 - CONVERSATIONAL:{"intent":"CONVERSATION", "message":str}
-- ADD_MEDICATION: { "intent": "ADD_MEDICATION", "medicine_name": str, "dosage_times": [str], "total_quantity": float|null, "duration_days": int|null }
+- ADD_MEDICATION: { "intent": "ADD_MEDICATION", "medicine_name": str, "dosage_times": [str], "total_quantity": float|null, "duration_days": int|null, "dose_quantity": float|null }
   dosage_times values: "morning", "evening", "night", or "HH:MM" for custom times
   duration_days: number of days for a finite course, null if ongoing
+  dose_quantity: how many tablets/units are taken AT EACH dose, null if one
+  total_quantity is the whole pack; dose_quantity is one sitting
+  e.g. "Take 2 tablets twice a day" → dosage_times: ["morning","night"], dose_quantity: 2
+  e.g. "1 tablet at night" → dose_quantity: null
+  e.g. "I have 30 tablets, take two every morning" → total_quantity: 30, dose_quantity: 2
   e.g. "Take azithromycin for 5 days" → duration_days: 5
   e.g. "Antibiotic twice a day for a week" → duration_days: 7
   e.g. "Take vitamin D every morning" → duration_days: null

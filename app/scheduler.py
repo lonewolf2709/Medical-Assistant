@@ -9,6 +9,7 @@ from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models import Medication, ReminderEvent, User
 from app.services.notification_service import send_message, send_message_with_buttons
+from app.services.medication_service import dose_units_for_event
 from app.services.reminder_service import complete_finished_courses
 from app.telegram_format import esc
 
@@ -82,7 +83,12 @@ async def _process_due_events(db: AsyncSession) -> None:
                     continue
 
             if event.type == "dose":
-                text = f"💊 Time to take your medication: <b>{med_name}</b>"
+                units = await dose_units_for_event(db, event)
+                if units > 1:
+                    # ":g" keeps 2.0 as "2" and 1.5 as "1.5".
+                    text = f"💊 Time to take <b>{units:g}</b> of <b>{med_name}</b>"
+                else:
+                    text = f"💊 Time to take your medication: <b>{med_name}</b>"
                 buttons = [[
                     {"text": "✅ Taken", "callback_data": f"taken:{event.id}"},
                     {"text": "❌ Skipped", "callback_data": f"skipped:{event.id}"},

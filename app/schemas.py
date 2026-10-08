@@ -31,6 +31,7 @@ class AddMedicationIntent(BaseModel):
     dosage_times: list[str]  # e.g. ["morning", "night"] or ["17:30"]
     total_quantity: float | None = None
     duration_days: int | None = None  # finite course; None means ongoing
+    dose_quantity: float | None = None  # units per dose; None means one
 
 
 class SetReminderIntent(BaseModel):

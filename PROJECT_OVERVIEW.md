@@ -57,8 +57,14 @@ are suppressed for `REFILL_REALERT_COOLDOWN_DAYS` so a daily recompute cannot na
 
 ### 5. Dose Quantity Tracking
 Stock is decremented when the user taps **✅ Taken** — not when the reminder is sent, since at
-send time we do not yet know whether they will take or skip the dose. `remaining_quantity` drops
-by `daily_dose / number_of_doses_per_day` and never goes below zero.
+send time we do not yet know whether they will take or skip the dose.
+
+Each `dosage_times` row carries a `dose_quantity` (units taken at that time, default 1), and
+`reminder_events.dosage_time_id` records which dose time produced the event — so the bot decrements
+by what that specific dose was actually worth. `medications.daily_dose` is therefore **units per
+day** (the sum of the dose quantities), not the number of doses, which is what the refill
+projection divides by. Events with no `dosage_time_id` (created before this existed) fall back to
+one unit. Quantity never goes below zero.
 
 Each reminder can be logged only once: `dose_logs.reminder_event_id` is unique, so repeated taps
 on the same reminder cannot double-count a dose or double-decrement stock.
@@ -224,7 +230,7 @@ Celery Beat
 |---|---|
 | users | Telegram user registry (UUID, telegram_id, timezone) |
 | medications | Medication records per user (name, quantity, daily_dose, course_end) |
-| dosage_times | Slot or custom time per medication |
+| dosage_times | Slot or custom time per medication, with units per dose |
 | reminder_events | Precomputed future notifications (dose + refill) |
 | prescriptions | Uploaded prescription image URLs + extracted text |
 | messages | Full message log (raw text, parsed intents JSON, bot reply, pending action) |
@@ -380,7 +386,7 @@ For individual medicine price check → Gemini estimates prices on 1mg, PharmEas
 |---|---|
 | users | Telegram user registry |
 | medications | Medication records (now includes `status`, `paused_until`) |
-| dosage_times | Slot or custom time per medication |
+| dosage_times | Slot or custom time per medication, with units per dose |
 | reminder_events | Precomputed future notifications |
 | prescriptions | Uploaded prescription images + extracted JSON |
 | messages | Message log (raw text, parsed intents, bot reply, pending_action) |
@@ -455,7 +461,7 @@ createdb medibuddy_test          # or: TEST_DATABASE_URL=postgresql+asyncpg://..
 pytest
 ```
 
-The 97 tests run against a real PostgreSQL database (the schema is recreated per test), so
+The 105 tests run against a real PostgreSQL database (the schema is recreated per test), so
 `FOR UPDATE SKIP LOCKED`, Postgres enums and UUID behaviour are exercised as in production. All
 outbound Telegram and Gemini calls are stubbed — the suite makes no network requests.
 

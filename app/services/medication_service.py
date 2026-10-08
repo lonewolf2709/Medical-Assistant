@@ -32,12 +32,18 @@ async def add_or_update_medication(
     dosage_times: list[str],
     total_quantity: float | None,
     duration_days: int | None = None,
+    dose_quantity: float | None = None,
 ) -> Medication:
     """Create or update a medication.
 
     `duration_days` marks a finite course ("take it for 5 days"); without it the
     medication is ongoing and reminders continue until the user stops it.
+
+    `dose_quantity` is how many units each dose is ("two tablets"), defaulting
+    to one. `daily_dose` is therefore units per day, not doses per day.
     """
+    per_dose = float(dose_quantity) if dose_quantity else 1.0
+    units_per_day = len(dosage_times) * per_dose
     med = await get_medication(db, user_id, name)
     if med is None:
         qty = total_quantity or 0.0
@@ -46,7 +52,7 @@ async def add_or_update_medication(
             name=name,
             total_quantity=qty,
             remaining_quantity=qty,
-            daily_dose=len(dosage_times),
+            daily_dose=units_per_day,
         )
         db.add(med)
         await db.flush()
@@ -54,7 +60,7 @@ async def add_or_update_medication(
         if total_quantity is not None:
             med.total_quantity = total_quantity
             med.remaining_quantity = total_quantity
-        med.daily_dose = len(dosage_times)
+        med.daily_dose = units_per_day
         # Remove old dosage times via explicit delete query (no lazy load)
         from sqlalchemy import delete as sa_delete
         await db.execute(sa_delete(DosageTime).where(DosageTime.medication_id == med.id))
@@ -73,19 +79,26 @@ async def add_or_update_medication(
     if duration_days is not None and duration_days > 0:
         med.course_end = datetime.now(timezone.utc) + timedelta(days=duration_days)
 
-    _attach_dosage_times(db, med, dosage_times)
+    _attach_dosage_times(db, med, dosage_times, per_dose)
     await db.commit()
     await db.refresh(med)
     return med
 
 
-def _attach_dosage_times(db: AsyncSession, med: Medication, dosage_times: list[str]) -> None:
+def _attach_dosage_times(
+    db: AsyncSession, med: Medication, dosage_times: list[str], dose_quantity: float = 1.0
+) -> None:
     for t in dosage_times:
         if t in SLOT_TIMES:
-            db.add(DosageTime(medication_id=med.id, type="slot", slot=t))
+            db.add(DosageTime(
+                medication_id=med.id, type="slot", slot=t, dose_quantity=dose_quantity
+            ))
         else:
             h, m = map(int, t.split(":"))
-            db.add(DosageTime(medication_id=med.id, type="custom", custom_time=time(h, m)))
+            db.add(DosageTime(
+                medication_id=med.id, type="custom", custom_time=time(h, m),
+                dose_quantity=dose_quantity,
+            ))
 
 
 async def apply_refill(
@@ -106,15 +119,23 @@ async def apply_refill(
     return med
 
 
-async def decrement_dose(db: AsyncSession, medication_id: uuid.UUID) -> None:
-    result = await db.execute(select(Medication).where(Medication.id == medication_id))
-    med = result.scalar_one_or_none()
-    if med and med.daily_dose > 0:
-        dt_result = await db.execute(select(DosageTime).where(DosageTime.medication_id == medication_id))
-        dosage_count = len(dt_result.scalars().all())
-        dose_per_event = med.daily_dose / max(dosage_count, 1)
-        med.remaining_quantity = max(0.0, med.remaining_quantity - dose_per_event)
-        await db.commit()
+async def dose_units_for_event(db: AsyncSession, event) -> float:
+    """How many units this particular reminder is worth."""
+    if event.dosage_time_id:
+        dosage_time = await db.get(DosageTime, event.dosage_time_id)
+        if dosage_time:
+            return dosage_time.dose_quantity
+    return 1.0  # events created before dose quantities existed
+
+
+async def decrement_dose(db: AsyncSession, event) -> None:
+    """Reduce stock by the units this dose was actually worth."""
+    med = await db.get(Medication, event.medication_id)
+    if med is None:
+        return
+    units = await dose_units_for_event(db, event)
+    med.remaining_quantity = max(0.0, med.remaining_quantity - units)
+    await db.commit()
 
 
 async def list_medications(db: AsyncSession, user_id: uuid.UUID) -> list[dict]:

@@ -50,6 +50,7 @@ class Medication(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     total_quantity: Mapped[float] = mapped_column(nullable=False, default=0)
     remaining_quantity: Mapped[float] = mapped_column(nullable=False, default=0)
+    # Units per day: the sum of every dose_quantity, not the number of doses.
     daily_dose: Mapped[float] = mapped_column(nullable=False, default=1)
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")  # active | paused | stopped | completed
     paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -70,6 +71,8 @@ class DosageTime(Base):
     type: Mapped[str] = mapped_column(Enum("slot", "custom", name="dosage_type"), nullable=False)
     slot: Mapped[str | None] = mapped_column(Enum("morning", "evening", "night", name="slot_type"), nullable=True)
     custom_time: Mapped[time | None] = mapped_column(Time, nullable=True)
+    # Units taken at this time — "two tablets at night" is 2.0.
+    dose_quantity: Mapped[float] = mapped_column(nullable=False, default=1.0, server_default="1")
 
     medication: Mapped["Medication"] = relationship(back_populates="dosage_times")
 
@@ -83,6 +86,11 @@ class ReminderEvent(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
     medication_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("medications.id"), nullable=False)
+    # Which dose time produced this event, so we know how many units it is.
+    # NULL for refill events and for rows created before this column existed.
+    dosage_time_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("dosage_times.id"), nullable=True
+    )
     trigger_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     type: Mapped[str] = mapped_column(Enum("dose", "refill", name="reminder_type"), nullable=False)
     status: Mapped[str] = mapped_column(Enum("pending", "sent", name="reminder_status"), nullable=False, default="pending")

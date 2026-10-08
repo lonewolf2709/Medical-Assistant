@@ -75,6 +75,7 @@ async def regenerate_dose_events(db: AsyncSession, medication: Medication) -> No
                 db.add(ReminderEvent(
                     user_id=medication.user_id,
                     medication_id=medication.id,
+                    dosage_time_id=dt.id,
                     trigger_time=trigger,
                     type="dose",
                     status="pending",
@@ -204,6 +205,7 @@ async def top_up_dose_events(
                 db.add(ReminderEvent(
                     user_id=medication.user_id,
                     medication_id=medication.id,
+                    dosage_time_id=dosage_time.id,
                     trigger_time=trigger,
                     type="dose",
                     status="pending",

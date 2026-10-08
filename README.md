@@ -33,6 +33,10 @@ user is told. A medication with no duration (a vitamin) is ongoing and reminds i
 **Dose tracking** — Every reminder carries ✅ Taken / ❌ Skipped / ⏰ Snooze buttons. Stock is
 decremented only when the user confirms they took the dose, and each reminder can be answered once.
 
+**Per-dose quantities** — "Take 2 tablets twice a day" records 2 units per dose, so stock drops by
+2 when the dose is taken, the reminder says how many to take, and the refill projection is based on
+4 tablets a day rather than 2.
+
 **Adherence reporting** — "How am I doing?" returns a per-medication percentage, where the
 denominator is reminders *sent*, so an ignored reminder counts as missed.
 
@@ -167,7 +171,7 @@ createdb medibuddy_test        # or set TEST_DATABASE_URL
 pytest
 ```
 
-97 tests run against a real PostgreSQL database (the schema is rebuilt per test) so
+105 tests run against a real PostgreSQL database (the schema is rebuilt per test) so
 `FOR UPDATE SKIP LOCKED`, Postgres enums and UUID handling behave as in production. Every
 outbound Telegram and Gemini call is stubbed — the suite makes no network requests.
 

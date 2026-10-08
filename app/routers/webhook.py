@@ -250,11 +250,14 @@ async def _route_intent(db, user, intent, chat_id: str, placeholder_id: int | No
             med = await medication_service.add_or_update_medication(
                 db, user.id, intent.medicine_name, intent.dosage_times,
                 intent.total_quantity, duration_days=intent.duration_days,
+                dose_quantity=intent.dose_quantity,
             )
             await reminder_service.regenerate_dose_events(db, med)
             await reminder_service.regenerate_refill_event(db, med)
             times = _esc(", ".join(intent.dosage_times))
             reply = f"✅ Added <b>{_esc(med.name)}</b> with reminders at: {times}"
+            if intent.dose_quantity and intent.dose_quantity > 1:
+                reply += f" ({intent.dose_quantity:g} each time)"
             if intent.duration_days:
                 reply += f" for {intent.duration_days} day(s)"
             return reply
@@ -667,7 +670,7 @@ async def _handle_dose_callback(
 
     if action == "taken":
         # Stock drops only once the user confirms they actually took the dose.
-        await decrement_dose(db, event.medication_id)
+        await decrement_dose(db, event)
         await answer_callback_query(callback_id, "✅ Marked as taken!")
         if message_id:
             await edit_message(chat_id, message_id, f"✅ <b>{med_name}</b> — taken")
