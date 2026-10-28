@@ -3,11 +3,11 @@ import uuid
 from datetime import datetime, timedelta, timezone, time
 
 import pytz
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import DosageTime, Medication, ReminderEvent, User
+from app.models import DosageTime, DoseLog, Medication, ReminderEvent, User
 
 SLOT_TIMES: dict[str, time] = {
     "morning": time(8, 0),
@@ -288,3 +288,48 @@ async def run_daily_maintenance(db: AsyncSession) -> dict[str, int]:
     topped_up = await top_up_dose_events(db)
     refreshed = await refresh_refill_events(db)
     return {"dose_windows_topped_up": topped_up, "refill_projections_refreshed": refreshed}
+
+
+async def nudge_unanswered_doses(
+    db: AsyncSession, now: datetime | None = None
+) -> list[ReminderEvent]:
+    """Pick the dose reminders that deserve a follow-up and record that we sent one.
+
+    A reminder qualifies when it was sent at least `dose_nudge_after_minutes`
+    ago, is still within `dose_nudge_window_minutes` (older ones are simply
+    missed), has no Taken/Skipped answer, and has not hit `dose_nudge_max`.
+    Snoozed reminders are `pending` again, so they never match.
+
+    Returns the events to nudge; the caller sends the messages.
+    """
+    now = now or datetime.now(timezone.utc)
+    newest_eligible = now - timedelta(minutes=settings.dose_nudge_after_minutes)
+    oldest_eligible = now - timedelta(minutes=settings.dose_nudge_window_minutes)
+
+    answered = exists().where(DoseLog.reminder_event_id == ReminderEvent.id)
+
+    events = (
+        await db.execute(
+            select(ReminderEvent)
+            .where(
+                ReminderEvent.type == "dose",
+                ReminderEvent.status == "sent",
+                ReminderEvent.trigger_time <= newest_eligible,
+                ReminderEvent.trigger_time >= oldest_eligible,
+                ReminderEvent.nudge_count < settings.dose_nudge_max,
+                ~answered,
+            )
+            # Bumping nudge_count is what makes this once-only; lock so two
+            # workers cannot both read 0 and both send.
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().all()
+    if not events:
+        return []
+
+    for event in events:
+        event.nudge_count += 1
+    await db.commit()
+
+    logger.info("Nudging %d unanswered dose reminder(s)", len(events))
+    return list(events)

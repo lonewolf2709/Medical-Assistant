@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     reminder_max_lateness_minutes: int = 120
     # Per-Telegram-user request budget.
     user_rate_limit_per_minute: int = 20
+    # Missed-dose nudges: an unanswered dose reminder gets one follow-up after
+    # `after` minutes, but only while it is still recent (`window`) — an old
+    # unanswered dose simply counts as missed rather than being resurrected.
+    dose_nudge_after_minutes: int = 30
+    dose_nudge_window_minutes: int = 180
+    dose_nudge_max: int = 1
     user_timezone: str = "Asia/Kolkata"
     debug: bool = False
     # Logs full request bodies, which contain user health data. Opt in explicitly.

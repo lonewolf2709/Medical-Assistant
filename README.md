@@ -1,5 +1,7 @@
 # MediBuddy — Medication Assistant Bot
 
+[![CI](https://github.com/lonewolf2709/Medical-Assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/lonewolf2709/Medical-Assistant/actions/workflows/ci.yml)
+
 A Telegram bot that manages medications through ordinary conversation. Users type or speak
 naturally — "Take Crocin morning and night", "I have 30 tablets left", "how am I doing?" — and the
 bot sets reminders, tracks stock, logs adherence, and warns before they run out.
@@ -32,6 +34,9 @@ user is told. A medication with no duration (a vitamin) is ongoing and reminds i
 
 **Dose tracking** — Every reminder carries ✅ Taken / ❌ Skipped / ⏰ Snooze buttons. Stock is
 decremented only when the user confirms they took the dose, and each reminder can be answered once.
+
+**Missed-dose nudges** — A reminder that goes unanswered for 30 minutes gets one follow-up with the
+same buttons, then stops. Reminders ignored for hours are left alone and simply count as missed.
 
 **Per-dose quantities** — "Take 2 tablets twice a day" records 2 units per dose, so stock drops by
 2 when the dose is taken, the reminder says how many to take, and the refill projection is based on
@@ -81,6 +86,7 @@ FastAPI ── verifies secret, returns 200 immediately, processes in the backgr
                                         │
 Celery Beat                             ▼
    ├── poll_reminders   (every 60s) → due reminder_events → Telegram
+   │                                 → nudges unanswered doses once
    │                                 → retires finished courses
    └── top_up_reminders (daily)     → extends the precomputed window
                                      → reprojects refill alerts
@@ -171,9 +177,12 @@ createdb medibuddy_test        # or set TEST_DATABASE_URL
 pytest
 ```
 
-105 tests run against a real PostgreSQL database (the schema is rebuilt per test) so
+113 tests run against a real PostgreSQL database (the schema is rebuilt per test) so
 `FOR UPDATE SKIP LOCKED`, Postgres enums and UUID handling behave as in production. Every
 outbound Telegram and Gemini call is stubbed — the suite makes no network requests.
+
+CI runs on every push and pull request: it applies the full migration chain to an empty
+PostgreSQL 16 database, then runs the suite against a second one.
 
 ---
 
@@ -198,6 +207,9 @@ outbound Telegram and Gemini call is stubbed — the suite makes no network requ
 | `TELEGRAM_CONNECT_TIMEOUT_SECONDS` | Telegram connect budget | `10` |
 | `REMINDER_MAX_LATENESS_MINUTES` | Retire a dose reminder later than this, undelivered | `120` |
 | `USER_RATE_LIMIT_PER_MINUTE` | Requests per Telegram user per minute | `20` |
+| `DOSE_NUDGE_AFTER_MINUTES` | Follow up on an unanswered dose reminder after this long | `30` |
+| `DOSE_NUDGE_WINDOW_MINUTES` | Don't nudge reminders older than this — they're just missed | `180` |
+| `DOSE_NUDGE_MAX` | Follow-ups per reminder | `1` |
 | `DEBUG` | Mounts the `/dev` router; verbose logs | `false` |
 | `LOG_REQUESTS` | Logs full request bodies — contains health data | `false` |
 

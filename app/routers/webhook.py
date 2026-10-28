@@ -159,11 +159,16 @@ async def _process_message_inner(update: TelegramUpdate) -> None:
             if pending_meds:
                 added = []
                 for m in pending_meds:
+                    # Same fields a typed message carries — a photographed
+                    # "1 tab twice daily x 5 days" must not become an ongoing
+                    # one-unit medication.
                     med = await medication_service.add_or_update_medication(
                         db, user.id,
                         m.get("medicine_name", ""),
                         m.get("dosage_times", []),
-                        m.get("total_quantity")
+                        m.get("total_quantity"),
+                        duration_days=m.get("duration_days"),
+                        dose_quantity=m.get("dose_quantity"),
                     )
                     await reminder_service.regenerate_dose_events(db, med)
                     await reminder_service.regenerate_refill_event(db, med)
@@ -477,10 +482,9 @@ async def _handle_photo(db, user, chat_id: str, photo: list) -> None:
         await send_message(chat_id, "No medications found in the image. Please add them manually.")
         return
 
-    lines = ["Found these medications in your prescription. Reply 'confirm' to add them all:\n"]
-    for m in medications:
-        lines.append(f"• {_esc(m.get('medicine_name'))} — {_esc(', '.join(m.get('dosage_times', [])))}")
-    await send_message(chat_id, "\n".join(lines))
+    from app.services.prescription_service import format_preview
+
+    await send_message(chat_id, format_preview(medications))
 
 
 async def _handle_voice(db, user, chat_id: str, voice) -> None:

@@ -10,7 +10,7 @@ from app.database import AsyncSessionLocal
 from app.models import Medication, ReminderEvent, User
 from app.services.notification_service import send_message, send_message_with_buttons
 from app.services.medication_service import dose_units_for_event
-from app.services.reminder_service import complete_finished_courses
+from app.services.reminder_service import complete_finished_courses, nudge_unanswered_doses
 from app.telegram_format import esc
 
 logger = logging.getLogger(__name__)
@@ -89,11 +89,7 @@ async def _process_due_events(db: AsyncSession) -> None:
                     text = f"💊 Time to take <b>{units:g}</b> of <b>{med_name}</b>"
                 else:
                     text = f"💊 Time to take your medication: <b>{med_name}</b>"
-                buttons = [[
-                    {"text": "✅ Taken", "callback_data": f"taken:{event.id}"},
-                    {"text": "❌ Skipped", "callback_data": f"skipped:{event.id}"},
-                    {"text": "⏰ Snooze 15min", "callback_data": f"snooze:{event.id}"},
-                ]]
+                buttons = _dose_buttons(event.id)
             else:
                 text = f"⚠️ <b>{med_name}</b> is running low. Reorder soon!"
                 buttons = [[
@@ -135,7 +131,35 @@ async def _announce_finished_courses(db: AsyncSession) -> None:
         )
 
 
+def _dose_buttons(event_id) -> list[list[dict]]:
+    return [[
+        {"text": "✅ Taken", "callback_data": f"taken:{event_id}"},
+        {"text": "❌ Skipped", "callback_data": f"skipped:{event_id}"},
+        {"text": "⏰ Snooze 15min", "callback_data": f"snooze:{event_id}"},
+    ]]
+
+
+async def _send_nudges(db: AsyncSession) -> None:
+    """Follow up once on dose reminders that went unanswered.
+
+    The buttons carry the ORIGINAL event id, so answering the nudge logs the
+    original dose — there is no second event to confuse adherence.
+    """
+    for event in await nudge_unanswered_doses(db):
+        user = await db.get(User, event.user_id)
+        medication = await db.get(Medication, event.medication_id)
+        if user is None:
+            continue
+        med_name = esc(medication.name) if medication else "your medication"
+        await send_message_with_buttons(
+            user.telegram_id,
+            f"⏰ Still haven't taken <b>{med_name}</b>? Let me know below.",
+            _dose_buttons(event.id),
+        )
+
+
 async def run_poll_cycle(db: AsyncSession) -> None:
-    """One scheduler tick: send what is due, then retire finished courses."""
+    """One scheduler tick: send what is due, nudge the ignored, retire finished courses."""
     await _process_due_events(db)
+    await _send_nudges(db)
     await _announce_finished_courses(db)

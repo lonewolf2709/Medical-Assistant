@@ -69,6 +69,19 @@ one unit. Quantity never goes below zero.
 Each reminder can be logged only once: `dose_logs.reminder_event_id` is unique, so repeated taps
 on the same reminder cannot double-count a dose or double-decrement stock.
 
+### 5b. Missed-Dose Nudges
+
+A dose reminder that is sent and never answered gets **one** follow-up after
+`DOSE_NUDGE_AFTER_MINUTES` (default 30), carrying the same Taken / Skipped / Snooze buttons and the
+**original** event id — so answering the nudge logs the original dose and there is no second event
+to confuse adherence. `reminder_events.nudge_count` records follow-ups sent, so it can never
+become a nag (`DOSE_NUDGE_MAX`, default 1).
+
+Only recent reminders qualify (`DOSE_NUDGE_WINDOW_MINUTES`, default 180): an unanswered dose from
+hours ago is not resurrected, it simply counts as missed. Snoozed reminders are `pending` again and
+never match. The sweep runs inside the 60-second poll cycle and locks rows with
+`FOR UPDATE SKIP LOCKED`, since bumping `nudge_count` is what makes it once-only across workers.
+
 ### 6. Strip-to-Tablet Conversion
 When recording a refill with unit "strip", the bot converts it to tablets automatically (1 strip = 10 tablets). Both `remaining_quantity` and `total_quantity` are updated.
 
@@ -260,6 +273,9 @@ Celery Beat
 | `TELEGRAM_CONNECT_TIMEOUT_SECONDS` | Telegram connect budget in seconds (default: 10) |
 | `REMINDER_MAX_LATENESS_MINUTES` | Dose reminders later than this are retired undelivered (default: 120) |
 | `USER_RATE_LIMIT_PER_MINUTE` | Per-Telegram-user request budget (default: 20) |
+| `DOSE_NUDGE_AFTER_MINUTES` | Follow up on an unanswered dose reminder after this long (default: 30) |
+| `DOSE_NUDGE_WINDOW_MINUTES` | Reminders older than this are not nudged (default: 180) |
+| `DOSE_NUDGE_MAX` | Follow-ups per reminder (default: 1) |
 | `DEBUG` | Mounts the `/dev` router; verbose logging (default: false) |
 | `LOG_REQUESTS` | Logs full request bodies — contains health data, development only (default: false) |
 
@@ -461,7 +477,7 @@ createdb medibuddy_test          # or: TEST_DATABASE_URL=postgresql+asyncpg://..
 pytest
 ```
 
-The 105 tests run against a real PostgreSQL database (the schema is recreated per test), so
+The 113 tests run against a real PostgreSQL database (the schema is recreated per test), so
 `FOR UPDATE SKIP LOCKED`, Postgres enums and UUID behaviour are exercised as in production. All
 outbound Telegram and Gemini calls are stubbed — the suite makes no network requests.
 
